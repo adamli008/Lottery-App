@@ -3,7 +3,7 @@
 //  LotteryApp
 //
 //  Created by adam li on 2026/4/21.
-//  modify some bug on 2026/4/29
+//  modify some bug on 2026/4/27
 
 import SwiftUI
 import UniformTypeIdentifiers
