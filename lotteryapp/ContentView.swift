@@ -3,7 +3,7 @@
 //  LotteryApp
 //
 //  Created by adam li on 2026/4/21.
-//  modify on 2026/4/26
+//  modify some bug on 2026/4/29
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -385,6 +385,14 @@ struct ContentView: View {
     @State private var showFileExporter = false
     @State private var showClearConfirm = false
     
+    // 用于精确获取底层窗口以执行全屏的属性
+    @State private var window: NSWindow?
+    @State private var hasEnteredFullScreen = false
+    
+    // 用于保存底层系统键盘监听器的引用
+    @State private var localEventMonitor: Any?
+    @State private var globalEventMonitor: Any?
+    
     var body: some View {
         HStack(spacing: 0) {
             // 核心功能与抽签展示区
@@ -402,6 +410,23 @@ struct ContentView: View {
             
             // 历史抽签记录展示区
             historyView
+        }
+        // 使用底层抓取器获取当前真实的窗口实例
+        .background(WindowAccessor(window: $window))
+        // 监听到窗口加载成功后，自动执行全屏操作，并绑定全局/局部键盘监听
+        .onChange(of: window) { newWindow in
+            if let win = newWindow, !hasEnteredFullScreen {
+                // 延迟触发全屏
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    if !win.styleMask.contains(.fullScreen) {
+                        win.toggleFullScreen(nil)
+                    }
+                }
+                hasEnteredFullScreen = true
+            }
+        }
+        .onAppear {
+            setupKeyboardMonitors()
         }
         // 全局弹窗交互反馈
         .alert(viewModel.messageTitle, isPresented: $viewModel.showMessage) {
@@ -445,6 +470,32 @@ struct ContentView: View {
                 break // 导出成功视情况可在此弹窗提示
             case .failure(let error):
                 viewModel.showError(title: "导出失败", message: error.localizedDescription)
+            }
+        }
+    }
+    
+    /// 设置系统级键盘监听器
+    private func setupKeyboardMonitors() {
+        // 1. 局部监听器（当程序正常处于激活状态时）
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // 49 代表空格键
+            if event.keyCode == 49 {
+                viewModel.toggleDraw()
+                // 拦截掉事件，这样 macOS 就不会发出“咚”的错误提示音了！
+                return nil
+            }
+            return event
+        }
+        
+        // 2. 全局监听器（当程序失去焦点，比如点击了副屏幕或桌面时！）
+        // 必须开启 Mac 的“辅助功能”权限才能生效。在丢失焦点时，依然能截获空格键。
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 49 {
+                // 安全判定：如果程序在后台（点击了别的屏幕），按空格只允许“停止抽签”。
+                // 防止你在别的软件里打字输入空格时，程序莫名其妙就开始抽签了。
+                if viewModel.isDrawing {
+                    viewModel.toggleDraw()
+                }
             }
         }
     }
@@ -547,8 +598,6 @@ struct ContentView: View {
                 Spacer() // 底部推力，使其垂直居中
                 
             } else {
-                Spacer() // 顶部推力
-                
                 let winners = viewModel.rollingWinners
                 let count = winners.count
                 
@@ -557,30 +606,37 @@ struct ContentView: View {
                 // 2. 将数据切分为完美匹配的行
                 let chunks = getChunkedWinners(winners: winners, rowCounts: rowCounts)
                 
-                // 3. 动态渲染网格。彻底抛弃绝对坐标堆叠，回归精美方阵。
-                VStack(spacing: 16) {
-                    ForEach(Array(chunks.enumerated()), id: \.offset) { rowIndex, chunk in
-                        HStack(spacing: 16) {
-                            ForEach(chunk, id: \.id) { person in
-                                winnerCard(for: person)
+                // 引入 GeometryReader 动态获取可用空间尺寸，以实现响应式缩放放大！
+                GeometryReader { geo in
+                    // 以 1200x800 为基准设计尺寸，计算当前大屏幕的缩放比例
+                    // max(1.0, ...) 确保在小屏上不会缩得太小，而在大屏（如4K）上会同步放大
+                    let scale = max(1.0, min(geo.size.width / 1200.0, geo.size.height / 800.0))
+                    
+                    VStack(spacing: 16 * scale) { // 行间距也按比例放大
+                        ForEach(Array(chunks.enumerated()), id: \.offset) { rowIndex, chunk in
+                            HStack(spacing: 16 * scale) { // 列间距同比例放大
+                                ForEach(Array(chunk.enumerated()), id: \.offset) { colIndex, person in
+                                    // 传入缩放因子 scale 给卡片视图
+                                    winnerCard(for: person, scale: scale)
+                                }
                             }
                         }
                     }
+                    // 最大宽度也根据缩放比例动态扩宽，彻底解决高分辨率下中间挤成一团的问题
+                    .frame(maxWidth: (count >= 13 ? 1600 : (count >= 9 ? 1200 : 1000)) * scale)
+                    .padding(24 * scale)
+                    // 让 VStack 在 GeometryReader 中绝对居中
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .center)
                 }
-                // 智能调整最大宽度：如果一行多达5人（如15人、20人时），将容器放宽，完美利用整个宽屏。
-                .frame(maxWidth: count >= 13 ? 1600 : (count >= 9 ? 1200 : 1000))
-                .padding()
-                
-                Spacer() // 底部推力
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity) // 整个展示区撑满屏幕
+        // 保留过渡动画：文字内容变更时有平滑的 crossfade 效果，且外框颜色渐变自然
         .animation(.default, value: viewModel.rollingWinners)
     }
     
-    /// 抽签动画区 - 人员信息卡片
-    private func winnerCard(for person: Person) -> some View {
-        // 使用当前正在展示的人数，确保动画和实际显示匹配
+    /// 抽签动画区 - 人员信息卡片 (支持大屏幕动态响应式缩放)
+    private func winnerCard(for person: Person, scale: CGFloat) -> some View {
         let count = viewModel.rollingWinners.count
         
         let isSingle = count == 1
@@ -589,16 +645,17 @@ struct ContentView: View {
         let isLarge = count >= 9 && count <= 12
         let isXLarge = count >= 13 // 13-20人档位
         
-        // 动态分配字体及间距大小，人数越多字体越小，确保 20 人同屏也能完美放下
-        let nameSize: CGFloat = isSingle ? 80 : (isSmall ? 56 : (isMedium ? 44 : (isLarge ? 32 : 24)))
-        let typeSize: CGFloat = isSingle ? 28 : (isSmall ? 20 : (isMedium ? 16 : (isLarge ? 12 : 10)))
-        let companySize: CGFloat = isSingle ? 32 : (isSmall ? 24 : (isMedium ? 20 : (isLarge ? 16 : 12)))
-        let groupSize: CGFloat = isSingle ? 28 : (isSmall ? 20 : (isMedium ? 16 : (isLarge ? 14 : 11)))
-        let cardPadding: CGFloat = isSingle ? 40 : (isSmall ? 28 : (isMedium ? 24 : (isLarge ? 16 : 12)))
-        let minHeight: CGFloat = isSingle ? 200 : (isSmall ? 150 : (isMedium ? 120 : (isLarge ? 90 : 70)))
+        // 动态分配基础字体及间距大小，然后全部乘以 scale 缩放因子！
+        let nameSize: CGFloat = (isSingle ? 80 : (isSmall ? 56 : (isMedium ? 44 : (isLarge ? 32 : 24)))) * scale
+        let typeSize: CGFloat = (isSingle ? 28 : (isSmall ? 20 : (isMedium ? 16 : (isLarge ? 12 : 10)))) * scale
+        let companySize: CGFloat = (isSingle ? 32 : (isSmall ? 24 : (isMedium ? 20 : (isLarge ? 16 : 12)))) * scale
+        let groupSize: CGFloat = (isSingle ? 28 : (isSmall ? 20 : (isMedium ? 16 : (isLarge ? 14 : 11)))) * scale
+        let cardPadding: CGFloat = (isSingle ? 40 : (isSmall ? 28 : (isMedium ? 24 : (isLarge ? 16 : 12)))) * scale
+        let minHeight: CGFloat = (isSingle ? 200 : (isSmall ? 150 : (isMedium ? 120 : (isLarge ? 90 : 70)))) * scale
+        let cornerRad: CGFloat = 16 * scale
         
-        return VStack(spacing: 8) {
-            HStack(alignment: .center, spacing: 12) {
+        return VStack(spacing: 8 * scale) {
+            HStack(alignment: .center, spacing: 12 * scale) {
                 // 使用带有全角空格格式化的 displayName 以对齐界面
                 Text(person.displayName)
                     .font(.system(size: nameSize, weight: .bold))
@@ -610,10 +667,10 @@ struct ContentView: View {
                 Text(person.userType)
                     .font(.system(size: typeSize, weight: .bold))
                     .foregroundColor(.white)
-                    .padding(.horizontal, isSingle ? 16 : (isMedium ? 12 : 8))
-                    .padding(.vertical, isSingle ? 8 : (isMedium ? 6 : 4))
+                    .padding(.horizontal, (isSingle ? 16 : (isMedium ? 12 : 8)) * scale)
+                    .padding(.vertical, (isSingle ? 8 : (isMedium ? 6 : 4)) * scale)
                     .background(Color.blue.opacity(0.8))
-                    .cornerRadius(8)
+                    .cornerRadius(8 * scale)
             }
             
             Text(person.companyName)
@@ -629,16 +686,16 @@ struct ContentView: View {
                 .minimumScaleFactor(0.5)
         }
         .padding(cardPadding)
-        // 允许卡片撑满网格的自适应宽度
+        // 允许卡片撑满网格的自适应宽度，同时按照大屏幕比例加高
         .frame(maxWidth: .infinity, minHeight: minHeight)
         .background(
-            RoundedRectangle(cornerRadius: 16)
+            RoundedRectangle(cornerRadius: cornerRad)
                 .fill(Color.accentColor.opacity(0.1))
         )
-        // 抽签过程中提供边界闪烁反馈
+        // 抽签过程中提供边界闪烁反馈，边框粗细也按比例适配
         .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.accentColor.opacity(viewModel.isDrawing ? 0.5 : 1.0), lineWidth: viewModel.isDrawing ? 2 : 4)
+            RoundedRectangle(cornerRadius: cornerRad)
+                .stroke(Color.accentColor.opacity(viewModel.isDrawing ? 0.5 : 1.0), lineWidth: (viewModel.isDrawing ? 2 : 4) * scale)
         )
     }
     
@@ -668,15 +725,9 @@ struct ContentView: View {
                 viewModel.toggleDraw()
             } label: {
                 Text(viewModel.isDrawing ? "停止抽签" : "开始抽签")
-                    .font(.title)
-                    .fontWeight(.bold)
-                    .frame(width: 240, height: 60)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(viewModel.isDrawing ? .red : .blue)
-            // 按钮点击反馈过渡效果
-            .scaleEffect(viewModel.isDrawing ? 0.98 : 1.0)
-            .animation(.easeInOut, value: viewModel.isDrawing)
+            // 采用完全自定义的 ButtonStyle，彻底免疫系统焦点丢失时的褪色机制！
+            .buttonStyle(SolidButtonStyle(isDrawing: viewModel.isDrawing))
         }
     }
     
@@ -688,38 +739,45 @@ struct ContentView: View {
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(NSColor.windowBackgroundColor))
+                // 加入高 Z 层级，确保标题绝对在最上方
+                .zIndex(1)
             
             Divider()
             
-            List {
-                ForEach(Array(viewModel.history.enumerated()), id: \.element.id) { index, record in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("\(viewModel.history.count - index).")
+            // 修复遮挡 Bug：抛弃导致穿透的 List，改用标准的 ScrollView + LazyVStack
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(Array(viewModel.history.enumerated()), id: \.element.id) { index, record in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("\(viewModel.history.count - index).")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                Text(record.person.displayName)
+                                    .font(.headline)
+                                
+                                // 历史记录也展示用户类型标签
+                                Text(record.person.userType)
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(0.2))
+                                    .cornerRadius(4)
+                            }
+                            Text("\(record.person.groupName) - \(record.person.companyName)")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
-                            Text(record.person.displayName)
-                                .font(.headline)
-                            
-                            // 历史记录也展示用户类型标签
-                            Text(record.person.userType)
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.2))
-                                .cornerRadius(4)
+                            Text(record.drawTime, style: .time)
+                                .font(.caption)
+                                .foregroundColor(.gray)
                         }
-                        Text("\(record.person.groupName) - \(record.person.companyName)")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                        Text(record.drawTime, style: .time)
-                            .font(.caption)
-                            .foregroundColor(.gray)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 16)
                     }
-                    .padding(.vertical, 4)
                 }
+                .padding(.top, 8)
             }
-            .listStyle(.sidebar)
+            .background(Color(NSColor.controlBackgroundColor))
             
             Divider()
             
@@ -745,6 +803,51 @@ struct ContentView: View {
         }
         .frame(width: 280)
         .background(Color(NSColor.controlBackgroundColor))
+    }
+}
+
+// MARK: - Helper (辅助层)
+
+/// 完全自定义的按钮渲染样式，免疫系统处于非活动状态时的强制变白/褪色
+struct SolidButtonStyle: ButtonStyle {
+    let isDrawing: Bool
+    
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.title)
+            .fontWeight(.bold)
+            .frame(width: 240, height: 60)
+            .background(isDrawing ? Color.red : Color.blue)
+            .foregroundColor(.white)
+            .cornerRadius(12)
+            // 按下时的视觉反馈缩放
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .opacity(configuration.isPressed ? 0.8 : 1.0)
+            // 平滑动画
+            .animation(.easeInOut(duration: 0.2), value: isDrawing)
+            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+
+/// 用于在 SwiftUI 中精确获取底层 NSWindow 的辅助视图
+struct WindowAccessor: NSViewRepresentable {
+    @Binding var window: NSWindow?
+    
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            self.window = view.window
+        }
+        return view
+    }
+    
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            if self.window != nsView.window {
+                self.window = nsView.window
+            }
+        }
     }
 }
 
